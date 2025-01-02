@@ -46,20 +46,50 @@ module axi_stream_insert_header #(
     assign last_out = last_out_reg;
     
     // 输入和输出就绪信号
-    assign ready_in = ready_out && (valid_insert || valid_in);
+    //assign ready_in = ready_out && (valid_insert || valid_in);
+    //改为：
+    //assign ready_in = (valid_insert && ~buffer_valid) || (valid_in && ~inserting_header);
+    /*仅当头部数据未缓存（~buffer_valid）时，允许接收头部数据。
+      仅当没有正在插入头部数据时，允许接收主数据流。
+      不再直接依赖 ready_out，确保输入握手信号独立于输出端状态。*/
+      //改为：
+      //assign ready_in = (valid_insert && ~buffer_valid) || (valid_in && (~inserting_header || ready_out));
+      /*增加了 ready_out 条件，确保即使在 inserting_header 状态下，
+      只要下游已经准备好（ready_out=1），主数据流可以立即恢复传输。
+      这样使得头部插入完成后，ready_in 无需等待多余的周期即可拉高。*/
+      //改为：
+      assign ready_in = (valid_insert && ~buffer_valid) || (valid_in && (~inserting_header || (last_in && ready_out)));
+    //增加 (last_in && ready_out) 的条件，确保最后一拍在下游准备好时优先处理，避免被阻塞
 
-    // 存储数据逻辑（避免传输泡沫）
+    // 存储数据逻辑（避免传输泡沫），判断是否需要将 data_insert 存入内部缓冲
     assign store_data = valid_insert && ready_out && ~buffer_valid;
 
     ///////////////////////////////////////////////////////////////////
     // 1. 实现 data_out 传输
     ///////////////////////////////////////////////////////////////////
-    always @(posedge clk or negedge rst_n) begin
-        if (~rst_n)
-            buffer_valid <= 1'b0;
-        else
-            buffer_valid <= buffer_valid ? ~ready_out : store_data;
-    end
+
+    //always @(posedge clk or negedge rst_n) begin
+      //  if (~rst_n)
+        //    buffer_valid <= 1'b0;
+        //else
+          //  buffer_valid <= buffer_valid ? ~ready_out : store_data;
+            /*如果头部数据有效 (valid_insert=1)，且模块准备好输出 (ready_out=1)，
+            则将头部数据缓存到 buffered_data 中。*/
+    //end 改为：
+            always @(posedge clk or negedge rst_n) begin
+                if (~rst_n) begin
+                    buffer_valid <= 1'b0;
+                    buffered_data <= {DATA_WD{1'b0}};
+                end else if (valid_insert && ~buffer_valid) begin
+                    buffer_valid <= 1'b1;
+                    buffered_data <= data_insert;
+                end else if (ready_out ) begin
+                    buffer_valid <= 1'b0;  // 数据已发送，清空缓存
+                end
+            end
+            /*仅在 valid_insert=1 且缓存未满（~buffer_valid）时存储头部数据。
+              当 ready_out=1 且 buffer_valid=1 时释放缓存数据。*/
+    
 
     always @(posedge clk or negedge rst_n) begin
         if (~rst_n)
@@ -83,12 +113,12 @@ module axi_stream_insert_header #(
             inserting_header <= 0;
         end else if (valid_insert && ready_in && !inserting_header) begin
             // 插入 header 数据
-            valid_out_reg <= valid_insert;
-            data_out_reg <= data_insert;
-            keep_out_reg <= keep_insert;
+            valid_out_reg <= valid_insert;// 插入头部数据
+            data_out_reg <= data_insert;// 头部数据输出到 data_out
+            keep_out_reg <= keep_insert;// 保持头部数据的有效字节标记
             last_out_reg <= 1'b0;  // header 永远不是最后一拍
             byte_cnt_reg <= byte_insert_cnt;
-            inserting_header <= 1;
+            inserting_header <= 1;//正在插入
         end
     end
 
@@ -117,45 +147,98 @@ module axi_stream_insert_header #(
     // 4. 判断 valid_out
     ///////////////////////////////////////////////////////////////////
     // 在传输数据时，valid_out 根据 valid_in 和插入标志控制
-    always @(posedge clk or negedge rst_n) begin
+    //always @(posedge clk or negedge rst_n) begin
+      //  if (~rst_n)
+        //    valid_out_reg <= 0;
+        //else if (valid_in && ready_in && !inserting_header) begin
+          //  valid_out_reg <= valid_in;
+        //end else if (valid_insert && ready_in && !inserting_header) begin
+          //  valid_out_reg <= valid_insert;
+        //end
+    //end 改为：
+    //always @(posedge clk or negedge rst_n) begin
+     //   if (~rst_n)
+       //     valid_out_reg <= 1'b0;
+        //else if (buffer_valid) begin
+          //  valid_out_reg <= 1'b1;  // 缓存数据有效
+        //end else if (valid_in && ~inserting_header) begin
+            //valid_out 可能因为 valid_in 和 inserting_header 的状态滞后，
+            //导致输出有效信号（valid_out=1）延迟一个周期
+          //  valid_out_reg <= valid_in;
+        //end else begin
+          //  valid_out_reg <= 1'b0;
+        //end
+    //end
+    /*优先发送头部数据（buffer_valid）。
+      当没有头部数据时，发送主数据流。
+      如果没有有效数据，valid_out_reg=0。*/
+    //改为：
+      always @(posedge clk or negedge rst_n) begin
         if (~rst_n)
-            valid_out_reg <= 0;
-        else if (valid_in && ready_in && !inserting_header) begin
-            valid_out_reg <= valid_in;
-        end else if (valid_insert && ready_in && !inserting_header) begin
-            valid_out_reg <= valid_insert;
+            valid_out_reg <= 1'b0;
+        else if (buffer_valid || (valid_in && ready_in)) begin
+            valid_out_reg <= 1'b1;  // 缓存或主数据有效
+        end else begin
+            valid_out_reg <= 1'b0;
         end
     end
-
+    //增加了 (valid_in && ready_in) 条件，确保在主数据流可以继续传输时，valid_out 能立即拉高
     ///////////////////////////////////////////////////////////////////
     // 5. 判断 keep_out 输出
     ///////////////////////////////////////////////////////////////////
+    //always @(posedge clk or negedge rst_n) begin
+      //  if (~rst_n)
+        //    keep_out_reg <= 0;
+        //else if (valid_out && inserting_header) begin
+            // 在插入 header 时，保持 keep_out 信号与 keep_insert 相一致
+          //  keep_out_reg <= keep_insert;
+        //end else if (valid_out && !inserting_header) begin
+            // 正常传输时，保持输入的 keep_in
+          //  keep_out_reg <= keep_in;
+        //end
+    //end
+    //改为
     always @(posedge clk or negedge rst_n) begin
         if (~rst_n)
             keep_out_reg <= 0;
-        else if (valid_out && inserting_header) begin
-            // 在插入 header 时，保持 keep_out 信号与 keep_insert 相一致
-            keep_out_reg <= keep_insert;
-        end else if (valid_out && !inserting_header) begin
-            // 正常传输时，保持输入的 keep_in
-            keep_out_reg <= keep_in;
+        else if (buffer_valid) begin
+            keep_out_reg <= keep_insert;  // 缓存头部时，使用头部的 keep
+        end else if (valid_in && ready_out) begin
+            keep_out_reg <= keep_in;  // 确保最后一拍的有效字节正确传递
         end
     end
+    /*优先处理缓存数据的 keep_insert。
+     在 valid_in && ready_out 时更新 keep_out，确保最后一拍的字节有效性*/
 
     ///////////////////////////////////////////////////////////////////
     // 6. 判断 last_out
     ///////////////////////////////////////////////////////////////////
+    //always @(posedge clk or negedge rst_n) begin
+      //  if (~rst_n)
+        //    last_out_reg <= 0;
+        //else if (valid_out && inserting_header) begin
+            // 在插入 header 时，last_out 永远为 0
+          //  last_out_reg <= 0;
+        //end else if (valid_out && !inserting_header && last_in) begin
+            // 如果不是插入 header 的状态，则按照 last_in 的值设置 last_out
+          //  last_out_reg <= last_in;
+        //end
+    //end
+    //改为：
     always @(posedge clk or negedge rst_n) begin
         if (~rst_n)
-            last_out_reg <= 0;
-        else if (valid_out && inserting_header) begin
-            // 在插入 header 时，last_out 永远为 0
-            last_out_reg <= 0;
-        end else if (valid_out && !inserting_header && last_in) begin
-            // 如果不是插入 header 的状态，则按照 last_in 的值设置 last_out
-            last_out_reg <= last_in;
+            last_out_reg <= 1'b0;
+        else if (buffer_valid) begin
+            last_out_reg <= 1'b0;  // 缓存头部时，last_out 置 0
+        end else if (valid_in && last_in && ready_out) begin
+            last_out_reg <= 1'b1;  // 确保最后一拍正确传递
+        end else begin
+            last_out_reg <= 1'b0;
         end
     end
+    /*优先处理 buffer_valid，保证头部插入时 last_out=0。
+     添加 valid_in && last_in && ready_out 的条件，确保最后一拍在下游准备好时能正确输出。
+     默认情况 last_out=0，避免意外干扰。*/
 
 endmodule
 
